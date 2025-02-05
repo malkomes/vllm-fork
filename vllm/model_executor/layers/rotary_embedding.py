@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 # Adapted from
 # https://github.com/huggingface/transformers/blob/v4.33.2/src/transformers/models/llama/modeling_llama.py
 # Copyright 2023 The vLLM team.
@@ -25,11 +27,9 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+from transformers import PretrainedConfig
 
 from vllm.model_executor.custom_op import CustomOp
-from vllm.platforms import current_platform
-
-is_hpu = current_platform.is_hpu()
 
 
 def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
@@ -99,34 +99,6 @@ class RotaryEmbedding(CustomOp):
         cache = cache.to(dtype)
         self.cos_sin_cache: torch.Tensor
         self.register_buffer("cos_sin_cache", cache, persistent=False)
-
-    def prepare_cos_sin(self,
-                        positions: torch.Tensor,
-                        offsets: Optional[torch.Tensor] = None,
-                        recompute_cos_sin: bool = False):
-        self.recompute_cos_sin = recompute_cos_sin
-        if offsets is not None:
-            offsets = offsets.view(positions.shape[0], -1)
-            positions = positions + offsets
-        positions = positions.flatten()
-        num_tokens = positions.shape[0]
-        cos_sin = self.cos_sin_cache.index_select(0, positions).view(
-            num_tokens, 1, -1)
-        cos, sin = cos_sin.chunk(2, dim=-1)
-        if self.is_neox_style:
-            cos = torch.cat((cos, cos), dim=-1)
-            sin = torch.cat((sin, sin), dim=-1)
-        else:
-            sin = torch.repeat_interleave(sin,
-                                          2,
-                                          dim=-1,
-                                          output_size=cos_sin.shape[-1])
-            cos = torch.repeat_interleave(cos,
-                                          2,
-                                          dim=-1,
-                                          output_size=cos_sin.shape[-1])
-        self.register_buffer("cos", cos, persistent=False)
-        self.register_buffer("sin", sin, persistent=False)
 
     def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
         """Compute the inverse frequency."""
@@ -234,14 +206,13 @@ class RotaryEmbedding(CustomOp):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         from habana_frameworks.torch.hpex.kernels import (
             RotaryPosEmbeddingMode, apply_rotary_pos_emb)
-
-        # Prepare cos-sin caches for long-context + LoRA with offsets for every
-        # forward, since the offset information wasn't available previously
-        if hasattr(self, "scaling_factors") or self.sin is None:
-            self.prepare_cos_sin(positions, offsets)
-        if self.recompute_cos_sin:
-            self.prepare_cos_sin(positions, offsets, recompute_cos_sin=True)
-        num_tokens = positions.shape[0] * positions.shape[1]
+        positions = positions.flatten()
+        if offsets is not None:
+            positions = positions + offsets
+        num_tokens = positions.shape[0]
+        cos_sin = self.cos_sin_cache.index_select(0, positions).view(
+            num_tokens, 1, -1)
+        cos, sin = cos_sin.chunk(2, dim=-1)
         # HPU RoPE kernel requires hidden dimension for cos and sin to be equal
         # to query hidden dimension, so the original tensors need to be
         # expanded
@@ -252,10 +223,19 @@ class RotaryEmbedding(CustomOp):
         rope_mode: RotaryPosEmbeddingMode
         if self.is_neox_style:
             rope_mode = RotaryPosEmbeddingMode.BLOCKWISE
+            cos = torch.cat((cos, cos), dim=-1)
+            sin = torch.cat((sin, sin), dim=-1)
         else:
             rope_mode = RotaryPosEmbeddingMode.PAIRWISE
-        sin = self.sin
-        cos = self.cos
+            sin = torch.repeat_interleave(sin,
+                                          2,
+                                          dim=-1,
+                                          output_size=cos_sin.shape[-1])
+            cos = torch.repeat_interleave(cos,
+                                          2,
+                                          dim=-1,
+                                          output_size=cos_sin.shape[-1])
+
         query_shape = query.shape
         query = query.view(num_tokens, -1, self.head_size)
         query_rot = query[..., :self.rotary_dim]
@@ -665,12 +645,9 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
                          is_neox_style, dtype)
 
     def _compute_inv_freq(self, scaling_factor: float) -> torch.Tensor:
-        pos_freqs = self.base**(
-            torch.arange(0,
-                         self.rotary_dim,
-                         2,
-                         dtype=torch.float,
-                         device="hpu" if is_hpu else "cuda") / self.rotary_dim)
+        pos_freqs = self.base**(torch.arange(
+            0, self.rotary_dim, 2, dtype=torch.float, device="cuda") /
+                                self.rotary_dim)
         inv_freq_extrapolation = 1.0 / pos_freqs
         inv_freq_interpolation = 1.0 / (scaling_factor * pos_freqs)
 
@@ -688,7 +665,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
     def _compute_cos_sin_cache(self) -> torch.Tensor:
         inv_freq = self._compute_inv_freq(self.scaling_factor)
         t = torch.arange(self.max_position_embeddings * self.scaling_factor,
-                         device="hpu" if is_hpu else "cuda",
+                         device="cuda",
                          dtype=torch.float32)
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
         cos = (freqs.cos() * self.mscale)
@@ -796,8 +773,12 @@ class MRotaryEmbedding(RotaryEmbedding):
         dtype: torch.dtype,
         mrope_section: Optional[List[int]] = None,
     ) -> None:
-        super().__init__(head_size, rotary_dim, max_position_embeddings, base,
-                         is_neox_style, dtype)
+        # In Qwen2.5-VL, the maximum index value is related to the duration of
+        # the input video. We enlarge max_position_embeddings to 4 times to get
+        # a larger the cos and sin cache.
+        self.cache_max_position_num = max_position_embeddings * 4
+        super().__init__(head_size, rotary_dim, self.cache_max_position_num,
+                         base, is_neox_style, dtype)
 
         self.mrope_section = mrope_section
         if self.mrope_section:
@@ -855,13 +836,10 @@ class MRotaryEmbedding(RotaryEmbedding):
     @staticmethod
     def get_input_positions(
         input_tokens: List[int],
+        hf_config: PretrainedConfig,
         image_grid_thw: Union[List[List[int]], torch.Tensor],
         video_grid_thw: Union[List[List[int]], torch.Tensor],
-        image_token_id: int,
-        video_token_id: int,
-        vision_start_token_id: int,
-        vision_end_token_id: int,
-        spatial_merge_size: int,
+        second_per_grid_ts: Optional[List[float]] = None,
         context_len: int = 0,
         seq_len: Optional[int] = None,
     ) -> Tuple[List[List[int]], int]:
@@ -869,16 +847,13 @@ class MRotaryEmbedding(RotaryEmbedding):
 
         llm_positions, mrope_position_delta = \
             MRotaryEmbedding.get_input_positions_tensor(
-                input_tokens,
-                image_grid_thw,
-                video_grid_thw,
-                image_token_id,
-                video_token_id,
-                vision_start_token_id,
-                vision_end_token_id,
-                spatial_merge_size,
-                context_len,
-                seq_len,
+                input_tokens=input_tokens,
+                hf_config=hf_config,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                second_per_grid_ts=second_per_grid_ts,
+                context_len=context_len,
+                seq_len=seq_len,
             )
 
         return llm_positions.tolist(), mrope_position_delta
@@ -886,17 +861,21 @@ class MRotaryEmbedding(RotaryEmbedding):
     @staticmethod
     def get_input_positions_tensor(
         input_tokens: List[int],
+        hf_config: PretrainedConfig,
         image_grid_thw: Union[List[List[int]], torch.Tensor],
         video_grid_thw: Union[List[List[int]], torch.Tensor],
-        image_token_id: int,
-        video_token_id: int,
-        vision_start_token_id: int,
-        vision_end_token_id: int,
-        spatial_merge_size: int,
+        second_per_grid_ts: Optional[List[float]] = None,
         context_len: int = 0,
         seq_len: Optional[int] = None,
     ) -> Tuple[torch.Tensor, int]:
         """Get mrope input positions and delta value."""
+
+        image_token_id = hf_config.image_token_id
+        video_token_id = hf_config.video_token_id
+        vision_start_token_id = hf_config.vision_start_token_id
+        spatial_merge_size = hf_config.vision_config.spatial_merge_size
+        tokens_per_second = getattr(hf_config.vision_config,
+                                    "tokens_per_second", 1.0)
 
         if isinstance(image_grid_thw, torch.Tensor):
             image_grid_thw = image_grid_thw.tolist()
@@ -916,6 +895,7 @@ class MRotaryEmbedding(RotaryEmbedding):
 
         image_index, video_index = 0, 0
         for _ in range(image_nums + video_nums):
+            video_second_per_grid_t = 0.0
             if image_token_id in input_tokens and remain_images > 0:
                 ed_image = input_tokens.index(image_token_id, st)
             else:
@@ -939,9 +919,13 @@ class MRotaryEmbedding(RotaryEmbedding):
                     video_grid_thw[video_index][1],
                     video_grid_thw[video_index][2],
                 )
+                video_second_per_grid_t = 1.0
+                if second_per_grid_ts is not None:
+                    video_second_per_grid_t = second_per_grid_ts[video_index]
                 video_index += 1
                 remain_videos -= 1
                 ed = ed_video
+
             llm_grid_t, llm_grid_h, llm_grid_w = \
                 t, h // spatial_merge_size, w // spatial_merge_size
             text_len = ed - st
@@ -951,8 +935,10 @@ class MRotaryEmbedding(RotaryEmbedding):
             llm_pos_ids_list.append(
                 torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
 
-            t_index = torch.arange(llm_grid_t).view(-1, 1).expand(
-                -1, llm_grid_h * llm_grid_w).flatten()
+            t_index = (torch.arange(llm_grid_t).view(-1, 1).expand(
+                -1, llm_grid_h * llm_grid_w) * video_second_per_grid_t *
+                       tokens_per_second).long().flatten()
+
             h_index = torch.arange(llm_grid_h).view(1, -1, 1).expand(
                 llm_grid_t, -1, llm_grid_w).flatten()
             w_index = torch.arange(llm_grid_w).view(1, 1, -1).expand(
