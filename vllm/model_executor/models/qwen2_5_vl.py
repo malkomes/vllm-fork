@@ -1092,6 +1092,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module, SupportsMultiModal,
                     video_input=video_input)
                 input_ids = None
 
+        import pdb; pdb.set_trace()
         hidden_states = self.language_model.model(
             input_ids=input_ids,
             positions=positions,

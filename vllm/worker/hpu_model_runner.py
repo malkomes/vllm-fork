@@ -953,14 +953,14 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                     )
 
                 mrope_positions = None
-                if self.runner.model_is_mrope:
+                if self.model_is_mrope:
                     image_grid_thw = mm_kwargs.get("image_grid_thw", None)
                     video_grid_thw = mm_kwargs.get("video_grid_thw", None)
                     assert image_grid_thw is not None or video_grid_thw is not None, (
                         "mrope embedding type requires multi-modal input mapper "
                         "returns 'image_grid_thw' or 'video_grid_thw'.")
 
-                    hf_config = self.runner.model_config.hf_config
+                    hf_config = self.model_config.hf_config
                     token_ids = seq_data.get_token_ids()
                     mrope_positions, mrope_position_delta = \
                         MRotaryEmbedding.get_input_positions(
@@ -973,14 +973,14 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                             vision_end_token_id=hf_config.vision_end_token_id,
                             spatial_merge_size=hf_config.vision_config.
                             spatial_merge_size,
-                            context_len=computed_len,
+                            context_len=context_len,
                         )
                     seq_data.mrope_position_delta = mrope_position_delta
                 if mrope_positions:
                     for idx in range(3):
                         input_mrope_positions[idx].extend(mrope_positions[idx])
                 else:
-                    input_positions.extend(list(range(computed_len, seq_len)))
+                    input_positions.extend(list(range(context_len, seq_len)))
 
 
                 multi_modal_kwargs_list.append(mm_kwargs)
@@ -1685,17 +1685,17 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         return x
 
     def profile_run(self) -> None:
-        num_layers = self.model_config.get_num_layers(self.parallel_config)
-        kv_caches = [None] * num_layers
-        bind_kv_cache(
-            self.vllm_config.compilation_config.static_forward_context,
-            [kv_caches])
-        _, max_seq_len = self.bucketing_ctx.get_max_prompt_shape()
-        max_batch_size = min(self.max_num_seqs,
-                             self.max_num_batched_tokens // max_seq_len)
+        # num_layers = self.model_config.get_num_layers(self.parallel_config)
+        # kv_caches = [None] * num_layers
+        # bind_kv_cache(
+        #     self.vllm_config.compilation_config.static_forward_context,
+        #     [kv_caches])
+        # _, max_seq_len = self.bucketing_ctx.get_max_prompt_shape()
+        # max_batch_size = min(self.max_num_seqs,
+        #                      self.max_num_batched_tokens // max_seq_len)
 
-        self.warmup_scenario(max_batch_size, max_seq_len, True, kv_caches,
-                             False, True)
+        # self.warmup_scenario(max_batch_size, max_seq_len, True, kv_caches,
+        #                      False, True)
         return
 
     def warmup_scenario(self,
