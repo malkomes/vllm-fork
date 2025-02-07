@@ -54,6 +54,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.sequence import (CompletionSequenceGroupOutput, IntermediateTensors,
                            Logprob, SequenceData, SequenceGroupMetadata,
                            SequenceOutput)
+from vllm.transformers_utils.config import uses_mrope
 from vllm.utils import (bind_kv_cache, is_fake_hpu, is_pin_memory_available,
                         make_tensor_with_pad)
 from vllm.worker.model_runner_base import (
@@ -407,6 +408,7 @@ class HpuModelAdapter:
             input_ids.device, self.dtype)
         LoraMask.setLoraMask(kwargs.pop('lora_mask'))
         #breakpoint()
+        import pdb; pdb.set_trace()
         if self.layer_names is not None:
             self._prepare_cos_sin(kwargs['positions'])
         with set_forward_context(kwargs['attn_metadata'], self.vllm_config,
@@ -704,12 +706,8 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
 
     @property
     def model_is_mrope(self) -> bool:
-        """Detect if the model has "mrope" rope_scaling type.
-        mrope requires keep "rope_deltas" between prompt and decoding phases."""
-        rope_scaling = getattr(self.model_config.hf_config, "rope_scaling", {})
-        if rope_scaling is None:
-            return False
-        return rope_scaling.get("type", None) == "mrope"
+        config = self.model_config.hf_config
+        return uses_mrope(config)
 
     def load_model(self) -> None:
         import habana_frameworks.torch.core as htcore

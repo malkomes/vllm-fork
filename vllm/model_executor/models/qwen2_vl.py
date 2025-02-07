@@ -502,6 +502,7 @@ class Qwen2VisionRotaryEmbedding(nn.Module):
             self._freqs_cached = freqs
 
     def forward(self, seqlen: int) -> torch.Tensor:
+        import pdb; pdb.set_trace()
         self.update_freqs_cache(seqlen)
         return self._freqs_cached[:seqlen]
 
