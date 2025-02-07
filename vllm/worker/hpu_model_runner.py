@@ -407,8 +407,7 @@ class HpuModelAdapter:
             kwargs['attn_metadata'], input_ids.size(0), input_ids.size(1),
             input_ids.device, self.dtype)
         LoraMask.setLoraMask(kwargs.pop('lora_mask'))
-        #breakpoint()
-        import pdb; pdb.set_trace()
+
         if self.layer_names is not None:
             self._prepare_cos_sin(kwargs['positions'])
         with set_forward_context(kwargs['attn_metadata'], self.vllm_config,
