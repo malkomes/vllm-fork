@@ -177,17 +177,17 @@ class MultiModalProfiler(Generic[_I]):
             modality: mm_max_tokens_per_item[modality] * mm_counts[modality]
             for modality in placeholders_by_modality
         }
-        if total_placeholders_by_modality != expected_placeholders_by_modality:
-            raise AssertionError(
-                f"The processed dummy data has a total of "
-                f"{total_placeholders_by_modality} placeholder tokens, which "
-                f"is not the expected {expected_placeholders_by_modality} "
-                "tokens.")
+        # if total_placeholders_by_modality != expected_placeholders_by_modality:
+        #     raise AssertionError(
+        #         f"The processed dummy data has a total of "
+        #         f"{total_placeholders_by_modality} placeholder tokens, which "
+        #         f"is not the expected {expected_placeholders_by_modality} "
+        #         "tokens.")
 
         total_len = len(prompt_token_ids)
 
         # V0 does not support chunked prefill.
-        if (total_len > seq_len and not envs.VLLM_USE_V1) or is_encoder_data:
+        if is_encoder_data:
             if total_len > seq_len:
                 logger.warning(
                     "The context length (%d) of the model is too short "

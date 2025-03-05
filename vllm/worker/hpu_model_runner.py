@@ -909,7 +909,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
     def _maybe_wrap_in_hpu_graph(self, *args, **kwargs):
         return htorch.hpu.wrap_in_hpu_graph(
             HpuModelAdapter(*args, **kwargs),
-            disable_tensor_cache=True,
+            disable_tensor_cache=False,
         ) if htorch.utils.internal.is_lazy() else HpuModelAdapter(
             *args, **kwargs)
 
@@ -1775,12 +1775,54 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         ])
         return attention_metadata
 
+    def create_dummy_multi_modal_seq_group_metadata(self,
+                                                    group_id,
+                                                    seq_len,
+                                                    lora_request,
+                                                    temperature):
+
+        from vllm.inputs import DummyData
+
+        if self.is_pooler:
+            sampling_params = None
+        else:
+            sampling_params = SamplingParams(temperature=temperature)
+                                            
+        dummy_data = self.input_registry \
+            .dummy_data_for_profiling(model_config=self.model_config,
+                                    seq_len=seq_len,
+                                    mm_registry=self.mm_registry)
+
+        return SequenceGroupMetadata(
+            request_id=str(group_id),
+            is_prompt=True,
+            seq_data={group_id: dummy_data.seq_data},
+            sampling_params=sampling_params,
+            block_tables=None,
+            lora_request=lora_request[group_id]
+            if lora_request else None,
+            multi_modal_data=dummy_data.multi_modal_data,
+            multi_modal_placeholders=dummy_data.
+            multi_modal_placeholders,
+        )
+
     def create_dummy_seq_group_metadata(self,
                                         group_id,
                                         seq_len,
                                         is_prompt,
                                         lora_request=None,
                                         temperature=0):
+
+        max_mm_tokens = self.mm_registry.get_max_multimodal_tokens(
+                self.model_config)
+        if seq_len > 0 and max_mm_tokens > 0:
+            return self.create_dummy_multi_modal_seq_group_metadata(
+                group_id=group_id,
+                seq_len=seq_len,
+                lora_request=lora_request,
+                temperature=temperature,
+            )
+
         if self.is_pooler:
             sampling_params = None
         else:
@@ -1814,9 +1856,12 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             self.vllm_config.compilation_config.static_forward_context,
             [kv_caches])
         _, max_seq_len = self.bucketing_ctx.get_max_prompt_shape()
+        print("max_seq_len", max_seq_len)
+        print("max_num_seqs", self.max_num_seqs)
+        print("max_num_batched_tokens", self.max_num_batched_tokens)
         max_batch_size = min(self.max_num_seqs,
                              self.max_num_batched_tokens // max_seq_len)
-
+        max_batch_size = 1
         self.warmup_scenario(max_batch_size, max_seq_len, True, kv_caches,
                              False, True)
         return
@@ -2688,9 +2733,18 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
                     if model_input.is_prompt:
                         output.prefill_hidden_states = hidden_states
                     output.hidden_states = hidden_states
+
+                from habana_frameworks.torch.hpu.metrics import metric_global
+                gc_metric = metric_global("graph_compilation")
+                print(" -------- graph_compilation: ", gc_metric.stats())
+
                 return [output] if self.is_driver_worker else []
             else:
                 return []
+
+        from habana_frameworks.torch.hpu.metrics import metric_global
+        gc_metric = metric_global("graph_compilation")
+        print(" -------- graph_compilation: ", gc_metric.stats())
 
         return output if type(output) is list else [output]
 
