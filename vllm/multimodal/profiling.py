@@ -187,7 +187,7 @@ class MultiModalProfiler(Generic[_I]):
         total_len = len(prompt_token_ids)
 
         # V0 does not support chunked prefill.
-        if is_encoder_data:
+        if (total_len > seq_len and not envs.VLLM_USE_V1) or is_encoder_data:
             if total_len > seq_len:
                 logger.warning(
                     "The context length (%d) of the model is too short "
