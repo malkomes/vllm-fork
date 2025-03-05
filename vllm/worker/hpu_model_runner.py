@@ -2039,19 +2039,25 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         logger.info(msg)
 
     def warmup_all_buckets(self, buckets, is_prompt, kv_caches):
-        # for i in range(5):
-        #     max_batch_size = 1
-        #     max_seq_len = self.max_num_batched_tokens            
-        #     self.log_warmup('Image', i, len(buckets), max_batch_size, max_seq_len)
-        #     self.warmup_scenario(
-        #         batch_size=max_batch_size,
-        #         seq_len=max_seq_len,
-        #         is_prompt=True,
-        #         kv_caches=kv_caches,
-        #         is_pt_profiler_run=False,
-        #         is_lora_profile_run=True,
-        #         multimodal_seqs_group_metada=True,
-        #     )
+        num_image_resolutions = 5
+        # TODO: The plan here is loop over a couple of image 
+        # resolutions and see if that helps during the warmup
+        # somehow indepedent of the batch_size, seq_len
+        # might need to mark.step() somewhere to split the
+        # HPU graph for video and language model
+        for i in range(num_image_resolutions):
+            max_batch_size = 1
+            max_seq_len = self.max_num_batched_tokens
+            self.log_warmup('Image', i, num_image_resolutions, max_batch_size, max_seq_len)
+            self.warmup_scenario(
+                batch_size=max_batch_size,
+                seq_len=max_seq_len,
+                is_prompt=True,
+                kv_caches=kv_caches,
+                is_pt_profiler_run=False,
+                is_lora_profile_run=True,
+                multimodal_seqs_group_metada=True,
+            )
         for i, (batch_size, seq_len) in enumerate(reversed(buckets)):
             self.log_warmup('Prompt' if is_prompt else 'Decode', i,
                             len(buckets), batch_size, seq_len)
