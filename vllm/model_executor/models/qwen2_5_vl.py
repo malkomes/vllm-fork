@@ -318,9 +318,9 @@ class Qwen2_5_VisionAttention(nn.Module):
                     output_i = FusedSDPA.apply(q_i, k_i, v_i, None, 0.0)
                 else:
                     output_i = F.scaled_dot_product_attention(q_i,
-                                                            k_i,
-                                                            v_i,
-                                                            dropout_p=0.0)
+                                                              k_i,
+                                                              v_i,
+                                                              dropout_p=0.0)
                 output_i = rearrange(output_i, "b h s d -> b s h d ")
                 outputs.append(output_i)
             context_layer = torch.cat(outputs, dim=1)
@@ -545,15 +545,21 @@ class Qwen2_5_VisionTransformer(nn.Module):
 
     def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
         pos_ids = []
+        #TODO:  h//2 w//2 -> DOESN"T WORK in PT_COMPILE_ONLY_MODE(warmup)
+        #Shape or reshape() need to be predetermined, not depends on the tensor value itself.
+        #grid_thw: 1024x1024 -> [[1,74,74]] -> reshape [37,2,37,2]
+        print("grid_thw:", grid_thw)
         for t, h, w in grid_thw:
-            hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
-            wpos_ids = torch.arange(w).unsqueeze(0).expand(h, -1)
+            hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)  #[74,74]
+            wpos_ids = torch.arange(w).unsqueeze(0).expand(h, -1)  #[74,74]
             hpos_ids = hpos_ids.reshape(
                 h // self.spatial_merge_size,
                 self.spatial_merge_size,
                 w // self.spatial_merge_size,
                 self.spatial_merge_size,
-            ).permute(0, 2, 1, 3).flatten()
+            ).permute(
+                0, 2, 1,
+                3).flatten()  #[37,2,37,2] => [37,2,2,37] => flatten [5476]
             wpos_ids = wpos_ids.reshape(
                 h // self.spatial_merge_size,
                 self.spatial_merge_size,
@@ -578,6 +584,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
         for grid_t, grid_h, grid_w in grid_thw:
             llm_grid_h = grid_h // self.spatial_merge_size
             llm_grid_w = grid_w // self.spatial_merge_size
+            #TODO: This arange, reshape based on the value of tensor can't work in WARMUP, or with TENSOR_CACHE
             index = torch.arange(grid_t * llm_grid_h * llm_grid_w).reshape(
                 grid_t, llm_grid_h, llm_grid_w)
             pad_h = vit_merger_window_size - llm_grid_h % vit_merger_window_size
@@ -616,7 +623,6 @@ class Qwen2_5_VisionTransformer(nn.Module):
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
 
         # windows attention
-        print(f" JUST BEFORE ATTENTION WINDOW {grid_thw.shape}")
         window_index, cu_window_seqlens = self.get_window_index(grid_thw)
 
         if is_hpu:
@@ -856,6 +862,10 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module, SupportsMultiModal,
                 raise ValueError(f"{name} should be 2D or batched 3D tensor. "
                                  f"Got ndim: {mm_input.ndim} "
                                  f"(shape={mm_input.shape})")
+            #TODO:  torch.concat(list(mm_input)) -> DOESN"T WORK in PT_COMPILE_ONLY_MODE(warmup)
+            #concat itself is not problem, but the value of the concat is later used in a other op
+            #which changes the shape
+            #import pdb;pdb.set_trace()
             return torch.concat(list(mm_input))
         else:
             return torch.concat(mm_input)
@@ -874,7 +884,10 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module, SupportsMultiModal,
                 pixel_values, "image pixel values")
             image_grid_thw = self._validate_and_reshape_mm_tensor(
                 image_grid_thw, "image grid_thw")
-
+            '''
+            pixel_values = pixel_values.view(-1, pixel_values.shape[-1])
+            image_grid_thw = image_grid_thw.view(-1, image_grid_thw.shape[-1])
+            '''
             if not isinstance(pixel_values, (torch.Tensor, list)):
                 raise ValueError("Incorrect type of image pixel values. "
                                  f"Got type: {type(pixel_values)}")
@@ -912,7 +925,10 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module, SupportsMultiModal,
                 pixel_values_videos, "video pixel values")
             video_grid_thw = self._validate_and_reshape_mm_tensor(
                 video_grid_thw, "video grid_thw")
-
+            '''
+            pixel_values_videos = pixel_values_videos.view(-1, pixel_values_videos.shape[-1])
+            video_grid_thw = video_grid_thw.view(-1, video_grid_thw.shape[-1])
+            '''
             return Qwen2_5_VLVideoPixelInputs(
                 type="pixel_values_videos",
                 pixel_values_videos=pixel_values_videos,
@@ -1062,10 +1078,9 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module, SupportsMultiModal,
         inputs_embeds: Optional[torch.Tensor] = None,
         **kwargs: object,
     ) -> Union[torch.Tensor, IntermediateTensors]:
-        print(f" qwen2_5_vl.py forward input_ids {input_ids.shape} and positions {positions.shape}")
-        if kwargs and "pixel_values" in kwargs:
-            print(f" pixel_values {kwargs['pixel_values'].shape}")
-            print(f" image_grid_thw {kwargs['image_grid_thw']}")
+        print(
+            f" qwen2_5_vl.py forward input_ids {input_ids.shape} and positions {positions.shape}"
+        )
         """Run forward pass for Qwen2.5-VL.
 
         Args:
@@ -1106,8 +1121,13 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module, SupportsMultiModal,
                     assert positions.ndim == 2 and positions.size(0) == 3, (
                         "multimodal section rotary embedding requires "
                         f"(3, seq_len) positions, but got {positions.size()}")
-                print(f" -- Calculate input embeddings_v0 input_ids {input_ids.shape}")
-                print(f" --                             image input {image_input['pixel_values'].shape}")
+
+                print(
+                    f" -- Calculate input embeddings_v0 input_ids {input_ids.shape}"
+                )
+                print(
+                    f" --                             image input {image_input['pixel_values'].shape}"
+                )
                 inputs_embeds = self.get_input_embeddings_v0(
                     input_ids,
                     image_input=image_input,

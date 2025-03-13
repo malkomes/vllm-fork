@@ -7,7 +7,6 @@
 import collections
 import contextlib
 import dataclasses
-import functools
 import gc
 import itertools
 import math
@@ -19,7 +18,6 @@ from typing import (TYPE_CHECKING, Any, Callable, Dict, List, NamedTuple,
                     Optional, Set, Tuple, Type, TypeVar, Union)
 
 import habana_frameworks.torch as htorch
-import habana_frameworks.torch.internal.bridge_config as bc
 import torch
 import vllm_hpu_extension.environment as environment
 from vllm_hpu_extension.bucketing import HPUBucketingContext
@@ -59,7 +57,8 @@ from vllm.sequence import (CompletionSequenceGroupOutput, IntermediateTensors,
                            SequenceOutput)
 from vllm.transformers_utils.config import uses_mrope
 from vllm.utils import (bind_kv_cache, is_fake_hpu, is_pin_memory_available,
-                        make_tensor_with_pad, make_mrope_positions_tensor_with_pad)
+                        make_mrope_positions_tensor_with_pad,
+                        make_tensor_with_pad)
 from vllm.worker.model_runner_base import (
     ModelRunnerBase, ModelRunnerInputBase,
     _add_attn_metadata_broadcastable_dict,
@@ -435,6 +434,7 @@ class HpuModelAdapter:
             input_ids.device, self.dtype)
         if 'lora_mask' in kwargs:
             LoraMask.setLoraMask(kwargs.pop('lora_mask'))
+
         model_config = getattr(self.model, "config", None)
         model_is_mrope = uses_mrope(model_config)
         if self.layer_names is not None and not model_is_mrope:
@@ -891,7 +891,8 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
     def _use_graphs(self, batch_size, seq_len, is_prompt):
         if self.enforce_eager:
             return False
-        if os.getenv('VLLM_LIMIT_HPU_GRAPH','true').lower() == 'true' and is_prompt:
+        if os.getenv('VLLM_LIMIT_HPU_GRAPH',
+                     'false').lower() == 'true' and is_prompt:
             return False
         if self.skip_warmup:
             return True
@@ -1160,12 +1161,11 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                                               max_prompt_len=max_prompt_len,
                                               pad=0)
         else:
-            input_positions = make_tensor_with_pad(
-                input_positions,
-                max_len=max_prompt_len,
-                pad=0,
-                dtype=torch.long,
-                device='cpu')
+            input_positions = make_tensor_with_pad(input_positions,
+                                                   max_len=max_prompt_len,
+                                                   pad=0,
+                                                   dtype=torch.long,
+                                                   device='cpu')
 
         slot_mapping = make_tensor_with_pad(slot_mapping,
                                             max_len=max_prompt_len,
@@ -1342,11 +1342,10 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             real_batch_size = len(seq_group_metadata_list)
             input_tokens = output[:real_batch_size].clone()
 
-        input_positions = torch.tensor(input_mrope_positions
-                                       if self.model_is_mrope
-                                       else input_positions,
-                                       dtype=torch.long,
-                                       device='cpu')
+        input_positions = torch.tensor(
+            input_mrope_positions if self.model_is_mrope else input_positions,
+            dtype=torch.long,
+            device='cpu')
 
         num_decode_tokens = len(seq_lens)
 
@@ -1741,16 +1740,11 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         ])
         return attention_metadata
 
-    def create_dummy_multi_modal_seq_group_metadata(self,
-                                                    group_id,
-                                                    seq_len,
-                                                    lora_request,
-                                                    temperature):
+    def create_dummy_multi_modal_seq_group_metadata(self, group_id, seq_len,
+                                                    lora_request, temperature):
 
-        from vllm.multimodal.profiling import MultiModalProfiler
         from vllm.multimodal.utils import cached_get_tokenizer
 
-        print("USING MY DUMMY MULTI MODAL")
         if self.is_pooler:
             sampling_params = None
         else:
@@ -1761,15 +1755,16 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             self.model_config.tokenizer,
             trust_remote_code=self.model_config.trust_remote_code,
         )
-        processor = self.mm_registry.create_processor(self.model_config, tokenizer)
-        mm_counts = self.mm_registry.get_mm_limits_per_prompt(self.model_config)
+        processor = self.mm_registry.create_processor(self.model_config,
+                                                      tokenizer)
+        mm_counts = self.mm_registry.get_mm_limits_per_prompt(
+            self.model_config)
         factory = processor.dummy_inputs
         processor_inputs = factory.get_dummy_processor_inputs(
             seq_len=seq_len,
             mm_counts=mm_counts,
             image_width=1024,
-            image_height=1024,
-        )
+            image_height=1024)
         mm_inputs = processor.apply(
             prompt=processor_inputs.prompt_text,
             mm_data=processor_inputs.mm_data,
@@ -1777,7 +1772,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         )
 
         prompt_token_ids = mm_inputs["prompt_token_ids"]
-        placeholders_by_modality = mm_inputs["mm_placeholders"]        
+        placeholders_by_modality = mm_inputs["mm_placeholders"]
 
         prompt_token_ids.extend([0] * (seq_len - len(prompt_token_ids)))
         seq_data = SequenceData.from_seqs(prompt_token_ids)
@@ -1788,12 +1783,10 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             seq_data={group_id: seq_data},
             sampling_params=sampling_params,
             block_tables=None,
-            lora_request=lora_request[group_id]
-            if lora_request else None,
+            lora_request=lora_request[group_id] if lora_request else None,
             multi_modal_data=mm_inputs["mm_kwargs"],
             multi_modal_placeholders=placeholders_by_modality,
         )
-
 
     def create_dummy_seq_group_metadata(self,
                                         group_id,
@@ -1807,6 +1800,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             sampling_params = SamplingParams(temperature=temperature)
             num_blocks = math.ceil(seq_len / self.block_size)
         seq_len = max(seq_len, 1)
+
         if is_prompt:
             input_len = seq_len
             output_len = 0
@@ -1869,6 +1863,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         # that will have unique loras, an therefore the max amount of memory
         # consumption create dummy lora request copies from the lora request
         # passed in, which contains a lora from the lora warmup path.
+
         dummy_lora_requests: List[LoRARequest] = []
         dummy_lora_requests_per_seq: List[LoRARequest] = []
         if self.lora_config and is_lora_profile_run:
@@ -1890,6 +1885,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                 ]
         self.profiler.start('internal', scenario_name)
         times = 3 if use_graphs or is_pt_profiler_run else 1
+
         if multimodal_seqs_group_metada:
             seqs = [
                 self.create_dummy_multi_modal_seq_group_metadata(
@@ -2004,7 +2000,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
 
     def warmup_all_buckets(self, buckets, is_prompt, kv_caches):
         num_image_resolutions = 5
-        # TODO: The plan here is loop over a couple of image 
+        # TODO: The plan here is loop over a couple of image
         # resolutions and see if that helps during the warmup
         # somehow indepedent of the batch_size, seq_len
         # might need to mark.step() somewhere to split the
@@ -2012,7 +2008,8 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         for i in range(num_image_resolutions):
             max_batch_size = 1
             max_seq_len = self.max_num_batched_tokens
-            self.log_warmup('Image', i, num_image_resolutions, max_batch_size, max_seq_len)
+            self.log_warmup('Image', i, num_image_resolutions, max_batch_size,
+                            max_seq_len)
             self.warmup_scenario(
                 batch_size=max_batch_size,
                 seq_len=max_seq_len,
@@ -2022,6 +2019,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                 is_lora_profile_run=True,
                 multimodal_seqs_group_metada=True,
             )
+
         for i, (batch_size, seq_len) in enumerate(reversed(buckets)):
             self.log_warmup('Prompt' if is_prompt else 'Decode', i,
                             len(buckets), batch_size, seq_len)
@@ -2128,6 +2126,9 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         start_mem = HabanaMemoryProfiler.current_device_memory_usage()
         start_time = time.perf_counter()
 
+        #TODO: Disable PT_COMPILE_ONLY_MODE for the qwen2.5-VL warmup
+        #Need to fix dynamic shape before we enable this
+        '''
         compile_only_mode_context = functools.partial(bc.env_setting,
                                                       "PT_COMPILE_ONLY_MODE",
                                                       True)
@@ -2141,6 +2142,8 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             logger.warning('Cannot use PT_COMPILE_ONLY_MODE. '
                            'Warmup time will be negatively impacted. '
                            'Please update Gaudi Software Suite.')
+        '''
+        can_use_compile_only_mode = False
         with compile_only_mode_context(
         ) if can_use_compile_only_mode else contextlib.nullcontext():
             self.warmup_all_buckets(self.bucketing_ctx.prompt_buckets, True,
@@ -2609,6 +2612,7 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
                 with self.profiler.record_event('internal',
                                                 model_event_name,
                                                 args=profiler_args):
+
                     hidden_states = self.model.forward(
                         **execute_model_kwargs,
                         selected_token_indices=sampling_metadata.
