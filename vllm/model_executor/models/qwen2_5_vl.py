@@ -547,8 +547,8 @@ class Qwen2_5_VisionTransformer(nn.Module):
         pos_ids = []
         #TODO:  h//2 w//2 -> DOESN"T WORK in PT_COMPILE_ONLY_MODE(warmup)
         #Shape or reshape() need to be predetermined, not depends on the tensor value itself.
-        #grid_thw: 1024x1024 -> [[1,74,74]] -> reshape [37,2,37,2]
-        print("grid_thw:", grid_thw)
+        # w, h, t
+        #grid_thw: 1024x1024 -> [[1,74,74]] -> reshape [37,2,37,2] -> flatten
         for t, h, w in grid_thw:
             hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)  #[74,74]
             wpos_ids = torch.arange(w).unsqueeze(0).expand(h, -1)  #[74,74]
@@ -615,6 +615,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
         x: torch.Tensor,
         grid_thw: torch.Tensor,
     ) -> torch.Tensor:
+        print(f"VisionTransformer: x-[{x.shape}, grid_thw-[{grid_thw}]")
         # patchify
         hidden_states = x.to(device=self.device, dtype=self.dtype)
         hidden_states = self.patch_embed(hidden_states)
@@ -880,6 +881,8 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module, SupportsMultiModal,
             return None
 
         if pixel_values is not None:
+            #print(f"pixel: {pixel_values.shape}, image_grid_thw:{image_grid_thw}")
+            #[[[1,74.74]]] => [[1,74.74]]
             pixel_values = self._validate_and_reshape_mm_tensor(
                 pixel_values, "image pixel values")
             image_grid_thw = self._validate_and_reshape_mm_tensor(
@@ -1103,7 +1106,6 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module, SupportsMultiModal,
                 in seconds) for each grid along the temporal dimension in the
                 3D position IDs. `None` if no videos are passed.
         """
-
         if intermediate_tensors is not None:
             inputs_embeds = None
 
@@ -1116,24 +1118,28 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module, SupportsMultiModal,
 
             if image_input is None and video_input is None:
                 inputs_embeds = None
+                print(f"LanguageModel: positions[{positions.shape}]], input_ids[{input_ids.shape}] ")
             else:
                 if uses_mrope(self.config):
                     assert positions.ndim == 2 and positions.size(0) == 3, (
                         "multimodal section rotary embedding requires "
                         f"(3, seq_len) positions, but got {positions.size()}")
 
-                print(
-                    f" -- Calculate input embeddings_v0 input_ids {input_ids.shape}"
-                )
-                print(
-                    f" --                             image input {image_input['pixel_values'].shape}"
-                )
+                print(f" -- Calculate input embeddings_v0 input_ids {input_ids.shape}")
+                if image_input:
+                    print(f" --   image input {image_input['pixel_values'].shape}")
+                if video_input:
+                    print(f" --   video input {video_input['pixel_values_videos'].shape}")
+
                 inputs_embeds = self.get_input_embeddings_v0(
                     input_ids,
                     image_input=image_input,
                     video_input=video_input)
                 input_ids = None
 
+                print(f"LanguageModel: positions[{positions.shape}]], input_embeds[{inputs_embeds.shape}] ")
+
+        
         hidden_states = self.language_model.model(
             input_ids=input_ids,
             positions=positions,
@@ -1142,6 +1148,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module, SupportsMultiModal,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
         )
+        print(f"Final output of hidden_states :", hidden_states.shape)
         return hidden_states
 
     def compute_logits(

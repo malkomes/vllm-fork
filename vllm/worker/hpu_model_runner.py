@@ -1741,7 +1741,8 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         return attention_metadata
 
     def create_dummy_multi_modal_seq_group_metadata(self, group_id, seq_len,
-                                                    lora_request, temperature):
+                                                    lora_request, temperature,
+                                                    height, width):
 
         from vllm.multimodal.utils import cached_get_tokenizer
 
@@ -1759,12 +1760,15 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                                                       tokenizer)
         mm_counts = self.mm_registry.get_mm_limits_per_prompt(
             self.model_config)
+        #mm_counts = {"image":1}
+        print("mm_counts:", mm_counts)
         factory = processor.dummy_inputs
         processor_inputs = factory.get_dummy_processor_inputs(
             seq_len=seq_len,
             mm_counts=mm_counts,
-            image_width=1024,
-            image_height=1024)
+            image_width=width,
+            image_height=height)
+
         mm_inputs = processor.apply(
             prompt=processor_inputs.prompt_text,
             mm_data=processor_inputs.mm_data,
@@ -1852,7 +1856,9 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                         is_pt_profiler_run=False,
                         is_lora_profile_run=False,
                         multimodal_seqs_group_metada=False,
-                        temperature=0) -> None:
+                        temperature=0,
+                        height=None,
+                        width=None) -> None:
         use_graphs = self._use_graphs(batch_size, seq_len, is_prompt)
         scenario_name = ("warmup_"
                          f"{'prompt' if is_prompt else 'decode'}_"
@@ -1894,7 +1900,8 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                     lora_request=dummy_lora_requests_per_seq[i]
                     if dummy_lora_requests_per_seq else None,
                     temperature=temperature,
-                ) for i in range(batch_size)
+                    height=height,
+                    width=width) for i in range(batch_size)
             ]
         elif is_prompt:
             seqs = [
@@ -1998,27 +2005,51 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                f"free_mem:{free_mem}")
         logger.info(msg)
 
+    def log_warmup_multimodal(self, phase, i, max_i, batch_size, seq_len,
+                              height, width):
+        free_mem = format_bytes(
+            HabanaMemoryProfiler.current_free_device_memory())
+        dim = "num_blocks"
+        if "Prompt" in phase:
+            dim = "seq_len"
+        msg = (f"[Warmup][{phase}][{i+1}/{max_i}] "
+               f"batch_size:{batch_size} "
+               f"{dim}:{seq_len}", f"hw:({height},{width})",
+               f"free_mem:{free_mem}")
+        logger.info(msg)
+
     def warmup_all_buckets(self, buckets, is_prompt, kv_caches):
-        num_image_resolutions = 5
         # TODO: The plan here is loop over a couple of image
         # resolutions and see if that helps during the warmup
         # somehow indepedent of the batch_size, seq_len
         # might need to mark.step() somewhere to split the
         # HPU graph for video and language model
-        for i in range(num_image_resolutions):
+
+        #TODO: Need also temporal for Video. For now we are experimenting just for the images.
+        # Generate the HW bucket  combinations
+        #TODO: Generating bucket with fixed batch, but need to combine with the batch from the seq_len batch.
+        VLLM_MULTIMODAL_BUCKET = 560  #Pick number divisible by 28(patchsize*mergesize)
+        max_seq_len = 2048  #self.max_num_batched_tokens
+        bucket = VLLM_MULTIMODAL_BUCKET
+        hw_bucket = [[h, w] for h in range(bucket, max_seq_len + 1, bucket)
+                     for w in range(bucket, max_seq_len + 1, bucket)]
+        print("Multimodal bucket :", hw_bucket)
+
+        # Iterate over the combinations
+        for i, (h, w) in enumerate(hw_bucket):
             max_batch_size = 1
-            max_seq_len = self.max_num_batched_tokens
-            self.log_warmup('Image', i, num_image_resolutions, max_batch_size,
-                            max_seq_len)
-            self.warmup_scenario(
-                batch_size=max_batch_size,
-                seq_len=max_seq_len,
-                is_prompt=True,
-                kv_caches=kv_caches,
-                is_pt_profiler_run=False,
-                is_lora_profile_run=True,
-                multimodal_seqs_group_metada=True,
-            )
+            max_seq_len = 2048  #self.max_num_batched_tokens
+            self.log_warmup_multimodal('Image', i, max_seq_len, max_batch_size,
+                                       max_seq_len, h, w)
+            self.warmup_scenario(batch_size=max_batch_size,
+                                 seq_len=max_seq_len,
+                                 is_prompt=True,
+                                 kv_caches=kv_caches,
+                                 is_pt_profiler_run=False,
+                                 is_lora_profile_run=True,
+                                 multimodal_seqs_group_metada=True,
+                                 height=h,
+                                 width=w)
 
         for i, (batch_size, seq_len) in enumerate(reversed(buckets)):
             self.log_warmup('Prompt' if is_prompt else 'Decode', i,
